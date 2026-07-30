@@ -1,4 +1,4 @@
-import { PenLine, Bot } from "lucide-react";
+import { PenLine, Bot, Smartphone } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { MessageRow } from "@/features/inbox/types";
 import { StatusIcon } from "./status-icon";
@@ -8,8 +8,20 @@ interface ChatMessageProps {
   message: MessageRow;
 }
 
-/** Author chip for outbound messages: "IA" badge or the operator's name. */
+/** Author chip for outbound messages: "IA" badge, "WhatsApp" (native app), or the operator's name. */
 function OutboundAuthor({ message }: { message: MessageRow }) {
+  // Sent from the business's native WhatsApp Business App (coexistence echo),
+  // not through the panel — has no sender_user_id either, so it must be
+  // checked before the AI fallback below or it would be mislabeled as IA.
+  if ((message.meta as Record<string, unknown> | null)?.source === "whatsapp_business_app") {
+    return (
+      <span className="inline-flex items-center gap-0.5 rounded bg-foreground/10 px-1 text-[9px] font-semibold uppercase tracking-wide text-foreground/70">
+        <Smartphone className="h-2.5 w-2.5" aria-hidden="true" />
+        WhatsApp
+      </span>
+    );
+  }
+
   // AI-generated when there is no human sender.
   if (!message.sender_user_id) {
     return (

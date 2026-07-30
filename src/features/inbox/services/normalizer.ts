@@ -1,5 +1,5 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import type { NormalizedInbound } from "./ycloud-webhook-handler";
+import type { NormalizedInbound, NormalizedEcho } from "./ycloud-webhook-handler";
 import type { ContactRow, ConversationRow, MessageRow } from "../types/index";
 
 function svc() {
@@ -167,6 +167,121 @@ export async function processInbound(
   //
   // See media-handler.ts for downloadAndStoreMedia() and patchMessageMedia().
   // NormalizedInbound extension (mediaLink field) + webhook wiring is D2 scope.
+
+  return { contact, conversation, message };
+}
+
+export interface ProcessEchoResult {
+  contact: ContactRow;
+  conversation: ConversationRow;
+  message: MessageRow | null;
+}
+
+/**
+ * Persists a message the business sent from the native WhatsApp Business App
+ * (coexistence "echo"), so the panel reflects what was replied outside it.
+ *
+ * - Upserts the contact/conversation, same as processInbound, but does NOT
+ *   touch window_expires_at (only a customer inbound resets the service
+ *   window) — it does clear unread_count since a human just handled this.
+ * - Inserts the message with direction 'out' and meta.source marking it as
+ *   sent from the native app, so the UI doesn't attribute it to the AI
+ *   (sender_user_id is null here too, since no panel user sent it).
+ */
+export async function processSmbEcho(
+  workspaceId: string,
+  normalized: NormalizedEcho,
+): Promise<ProcessEchoResult> {
+  const supabase = svc();
+
+  const { data: biRow } = await supabase
+    .from("business_info")
+    .select("structured")
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+  const defaultCc =
+    ((biRow?.structured as { default_country_code?: string } | null)
+      ?.default_country_code as string) ?? DEFAULT_COUNTRY_CODE;
+
+  const phone = normalizePhone(normalized.to, defaultCc);
+
+  const { data: contactData, error: contactError } = await supabase
+    .from("contacts")
+    .upsert(
+      {
+        workspace_id: workspaceId,
+        phone,
+        opt_in: true,
+        opt_in_at: new Date().toISOString(),
+      },
+      {
+        onConflict: "workspace_id,phone",
+        ignoreDuplicates: false,
+      },
+    )
+    .select()
+    .single();
+
+  if (contactError || !contactData) {
+    throw new Error(
+      `[normalizer] echo contact upsert failed: ${contactError?.message}`,
+    );
+  }
+
+  const contact = contactData as ContactRow;
+
+  const { data: convData, error: convError } = await supabase
+    .from("conversations")
+    .upsert(
+      {
+        workspace_id: workspaceId,
+        contact_id: contact.id,
+        channel: "whatsapp",
+        last_message_at: new Date().toISOString(),
+        unread_count: 0,
+      },
+      {
+        onConflict: "workspace_id,contact_id,channel",
+        ignoreDuplicates: false,
+      },
+    )
+    .select()
+    .single();
+
+  if (convError || !convData) {
+    throw new Error(
+      `[normalizer] echo conversation upsert failed: ${convError?.message}`,
+    );
+  }
+
+  const conversation = convData as ConversationRow;
+
+  const { data: msgData, error: msgError } = await supabase
+    .from("messages")
+    .upsert(
+      {
+        workspace_id: workspaceId,
+        conversation_id: conversation.id,
+        direction: "out" as const,
+        type: normalized.type,
+        body: normalized.text,
+        wamid: normalized.wamid,
+        status: "sent",
+        meta: { source: "whatsapp_business_app" },
+      },
+      {
+        onConflict: "workspace_id,wamid",
+        ignoreDuplicates: true,
+      },
+    )
+    .select()
+    .single();
+
+  if (msgError && msgError.code !== "PGRST116") {
+    throw new Error(`[normalizer] echo message insert failed: ${msgError?.message}`);
+  }
+
+  const message = msgData ? (msgData as MessageRow) : null;
 
   return { contact, conversation, message };
 }

@@ -3,8 +3,9 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
   verifyYCloudSignature,
   parseInbound,
+  parseSmbEcho,
 } from "@/features/inbox/services/ycloud-webhook-handler";
-import { processInbound } from "@/features/inbox/services/normalizer";
+import { processInbound, processSmbEcho } from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   upsertBatch,
@@ -18,6 +19,8 @@ import {
   transcribeAudio,
   describeImage,
 } from "@/features/inbox/services/media-understanding";
+import { applyTransition } from "@/features/inbox/services/decision-engine";
+import { getActiveAgent } from "@/features/agents/services/active-agent";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -99,14 +102,31 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       "type" in body &&
       (body as { type: string }).type === "whatsapp.message.updated";
 
+    // Coexistence: message sent by the business from the native WhatsApp
+    // Business App (not through our API) — YCloud syncs it back to us so we
+    // know a human already replied and the AI should stop on that thread.
+    const isSmbEcho =
+      typeof body === "object" &&
+      body !== null &&
+      "type" in body &&
+      (body as { type: string }).type === "whatsapp.smb.message.echoes";
+
     // Extract destination phone to identify the workspace integration (inbound).
+    // For an echo, the identifying phone is the BUSINESS number (whatsappMessage.from)
+    // rather than the customer's — the message direction is reversed.
     const toPhone =
       typeof body === "object" &&
       body !== null &&
       "whatsappInboundMessage" in body
         ? ((body as { whatsappInboundMessage?: { to?: string } })
             .whatsappInboundMessage?.to ?? null)
-        : null;
+        : isSmbEcho &&
+            typeof body === "object" &&
+            body !== null &&
+            "whatsappMessage" in body
+          ? ((body as { whatsappMessage?: { from?: string } })
+              .whatsappMessage?.from ?? null)
+          : null;
 
     // Events that carry NO actionable data AND cannot identify a workspace
     // (no wsid, no inbound `to`, not a status update) → harmless early 200.
@@ -181,6 +201,40 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
       }
       return NextResponse.json({ received: true });
+    }
+
+    // Coexistence echo — the business replied from the native app. Record it
+    // and stop the AI on this thread, same as a manual inbox reply does.
+    if (isSmbEcho) {
+      const normalizedEcho = parseSmbEcho(body);
+      if (!normalizedEcho) {
+        return NextResponse.json({ received: true });
+      }
+
+      const workspaceId = ws.workspace_id as string;
+      const { conversation, message } = await processSmbEcho(
+        workspaceId,
+        normalizedEcho,
+      );
+
+      // Duplicate wamid (webhook retry) — already handled on first delivery.
+      if (message && conversation.ai_enabled) {
+        try {
+          const activeAgent = await getActiveAgent(workspaceId);
+          const sleepOnManual =
+            activeAgent?.config.sleepOnManualMessage !== false;
+          if (sleepOnManual) {
+            await applyTransition(conversation.id, "human_active");
+          }
+        } catch (e) {
+          console.warn(
+            "[webhook] echo sleep-on-manual skipped:",
+            e instanceof Error ? e.message : e,
+          );
+        }
+      }
+
+      return NextResponse.json({ received: true, echo: true });
     }
 
     const normalized = parseInbound(body);

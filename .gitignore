@@ -67,3 +67,4 @@ supabase/cron/*.filled.sql
 
 # NOTE: package-lock.json is intentionally NOT ignored.
 # A distribution template must ship its lockfile for reproducible installs.
+.env*

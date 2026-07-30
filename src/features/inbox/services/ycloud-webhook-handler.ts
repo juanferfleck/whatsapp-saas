@@ -143,6 +143,11 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
 
     const msgType = typeof wimObj.type === "string" ? wimObj.type : "unknown";
 
+    // A reaction (emoji tap on a prior message) is not a real inbound message —
+    // it carries no content for the agent to respond to. Drop it here so it
+    // never becomes a message row or reaches the buffer/AI pipeline.
+    if (msgType === "reaction") return null;
+
     const createTime =
       typeof event.createTime === "string"
         ? event.createTime
@@ -201,6 +206,110 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       text,
       wamid,
       customerName,
+      createTime,
+      mediaLink,
+      mediaId,
+      mediaMime,
+      mediaFilename,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface NormalizedEcho {
+  /** Customer phone (E.164) the business replied to */
+  to: string;
+  /** Message type as reported by YCloud */
+  type: string;
+  /** Text content, the media caption, or "[Multimedia]" when neither exists */
+  text: string | null;
+  /** YCloud WhatsApp message ID */
+  wamid: string;
+  /** ISO send timestamp */
+  createTime: string;
+  /** YCloud media download URL (api.ycloud.com) for media messages */
+  mediaLink: string | null;
+  /** YCloud media id, when present */
+  mediaId: string | null;
+  /** Declared MIME type of the media */
+  mediaMime: string | null;
+  /** Original filename (document messages) */
+  mediaFilename: string | null;
+}
+
+/**
+ * Parses a `whatsapp.smb.message.echoes` event — a message the business sent
+ * from the native WhatsApp Business App (coexistence mode), synced back to us
+ * so we know a human already replied outside the panel.
+ * Returns null if the event isn't this type or is malformed.
+ */
+export function parseSmbEcho(body: unknown): NormalizedEcho | null {
+  try {
+    if (typeof body !== "object" || body === null) return null;
+
+    const event = body as Record<string, unknown>;
+    if (event.type !== "whatsapp.smb.message.echoes") return null;
+
+    const wm = event.whatsappMessage;
+    if (typeof wm !== "object" || wm === null) return null;
+
+    const wmObj = wm as Record<string, unknown>;
+
+    const wamid = wmObj.wamid;
+    if (typeof wamid !== "string" || !wamid) return null;
+
+    const to = wmObj.to;
+    if (typeof to !== "string" || !to) return null;
+
+    const msgType = typeof wmObj.type === "string" ? wmObj.type : "unknown";
+
+    const createTime =
+      typeof wmObj.sendTime === "string"
+        ? wmObj.sendTime
+        : typeof event.createTime === "string"
+          ? event.createTime
+          : new Date().toISOString();
+
+    let text: string | null = null;
+    let mediaLink: string | null = null;
+    let mediaId: string | null = null;
+    let mediaMime: string | null = null;
+    let mediaFilename: string | null = null;
+
+    if (msgType === "text") {
+      const textObj = wmObj.text;
+      if (typeof textObj === "object" && textObj !== null) {
+        const t = (textObj as Record<string, unknown>).body;
+        text = typeof t === "string" ? t : null;
+      }
+    } else if (MEDIA_TYPES.includes(msgType)) {
+      const mediaObj = wmObj[msgType];
+      if (typeof mediaObj === "object" && mediaObj !== null) {
+        const m = mediaObj as Record<string, unknown>;
+        mediaLink = typeof m.link === "string" ? m.link : null;
+        mediaId = typeof m.id === "string" ? m.id : null;
+        mediaMime =
+          typeof m.mimeType === "string"
+            ? m.mimeType
+            : typeof m.mime_type === "string"
+              ? m.mime_type
+              : null;
+        mediaFilename = typeof m.filename === "string" ? m.filename : null;
+        if (typeof m.caption === "string" && m.caption.trim()) {
+          text = m.caption;
+        }
+      }
+      if (text === null) text = "[Multimedia]";
+    } else {
+      text = "[Multimedia]";
+    }
+
+    return {
+      to,
+      type: toMessageType(msgType),
+      text,
+      wamid,
       createTime,
       mediaLink,
       mediaId,
