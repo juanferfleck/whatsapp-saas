@@ -318,7 +318,9 @@ export async function dispatchTemplate(
         language: templateLanguage,
         components,
       });
-      wamid = sent.wamid;
+      // YCloud returns its `id` on send and assigns the wamid later; an empty
+      // string would collide on the UNIQUE (workspace_id, wamid) of the next send.
+      wamid = sent.wamid || undefined;
     } catch (sendErr) {
       const errMsg =
         sendErr instanceof Error ? sendErr.message : String(sendErr);

@@ -26,7 +26,10 @@ const bodySchema = z
     workspace_id: z.string().uuid().optional(),
     /** Customer phone. */
     to: z.string().min(5).max(30),
-    wamid: z.string().min(1).max(200),
+    /** YCloud's own message id, returned synchronously by the send API. */
+    ycloud_id: z.string().min(1).max(200).optional(),
+    /** WhatsApp message id. YCloud does not return it on send; usually omit. */
+    wamid: z.string().min(1).max(200).optional(),
     template_name: z.string().min(1).max(200),
     /** The text the customer actually received (variables already filled). */
     text: z.string().min(1).max(4096),
@@ -37,6 +40,9 @@ const bodySchema = z
   })
   .refine((d) => d.from || d.workspace_id, {
     message: "Provide `from` (business number) or `workspace_id`",
+  })
+  .refine((d) => d.ycloud_id || d.wamid, {
+    message: "Provide `ycloud_id` (from the YCloud send response) or `wamid`",
   });
 
 function secretMatches(header: string | null): boolean {
@@ -93,6 +99,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       workspaceId,
       to: body.to,
       wamid: body.wamid,
+      ycloudId: body.ycloud_id,
       templateName: body.template_name,
       body: body.text,
       origin: body.source,

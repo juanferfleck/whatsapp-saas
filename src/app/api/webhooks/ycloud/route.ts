@@ -6,7 +6,10 @@ import {
   parseSmbEcho,
 } from "@/features/inbox/services/ycloud-webhook-handler";
 import { processInbound, processSmbEcho } from "@/features/inbox/services/normalizer";
-import { ingestUntrackedFromStatus } from "@/features/inbox/services/outbound-ingest";
+import {
+  adoptExternalOutbound,
+  ingestUntrackedFromStatus,
+} from "@/features/inbox/services/outbound-ingest";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   upsertBatch,
@@ -46,17 +49,32 @@ async function handleStatusUpdate(
   wamid: string,
   newStatus: string,
 ): Promise<void> {
-  const { data: msg } = await supabase
+  const { data: found } = await supabase
     .from("messages")
     .select("id, status")
     .eq("workspace_id", workspaceId)
     .eq("wamid", wamid)
     .maybeSingle();
 
-  // Message not found — an outbound we didn't track: typically a template sent
-  // by another system through this same YCloud number (e.g. class booking
-  // confirmations/reminders). Record it so the agent has the context when the
-  // customer replies. Never let a failure here break the status webhook.
+  let msg: { id: string; status: string | null } | null = found ?? null;
+
+  // A row pushed by another system (e.g. booking confirmations) has no wamid
+  // yet — YCloud only reveals it here. Attach it so the status applies to it.
+  if (!msg) {
+    try {
+      msg = await adoptExternalOutbound(workspaceId, whatsappMessage);
+    } catch (e) {
+      console.warn(
+        "[webhook] adopt external outbound skipped:",
+        e instanceof Error ? e.message : "unknown",
+      );
+    }
+  }
+
+  // Still not found — an outbound we didn't track at all: typically a template
+  // sent by another system through this same YCloud number that never pushed.
+  // Record it so the agent has the context when the customer replies. Never let
+  // a failure here break the status webhook.
   if (!msg) {
     try {
       await ingestUntrackedFromStatus(workspaceId, whatsappMessage, newStatus);

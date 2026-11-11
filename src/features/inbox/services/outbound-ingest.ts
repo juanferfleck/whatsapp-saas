@@ -38,8 +38,14 @@ export interface OutboundIngestInput {
   workspaceId: string;
   /** Customer phone (any spelling). */
   to: string;
-  /** Required: it is the dedup key and what status webhooks match on. */
-  wamid: string;
+  /**
+   * WhatsApp message id. YCloud does NOT return it when a message is sent — it
+   * only arrives later in the status webhook — so external senders normally
+   * omit it and identify the message with `ycloudId` instead.
+   */
+  wamid?: string | null;
+  /** YCloud's own message id (returned synchronously by the send API). */
+  ycloudId?: string | null;
   templateName: string;
   /** Rendered message text the customer actually received. */
   body: string;
@@ -167,38 +173,89 @@ export async function ingestOutboundTemplate(
     contactId,
   );
 
-  const meta: Record<string, unknown> = {
-    source: "external_automation",
-    automated: true,
-    origin,
-    template_name: input.templateName,
-    ...(input.placeholder ? { placeholder: true } : {}),
+  const wamid = input.wamid || null;
+  const ycloudId = input.ycloudId || null;
+  if (!wamid && !ycloudId) {
+    throw new Error("[outbound-ingest] wamid or ycloudId is required");
+  }
+
+  const buildMeta = (prev?: Record<string, unknown> | null) => {
+    const keepId = ycloudId ?? (prev?.ycloud_id as string | undefined) ?? null;
+    return {
+      source: "external_automation",
+      automated: true,
+      origin,
+      template_name: input.templateName,
+      ...(keepId ? { ycloud_id: keepId } : {}),
+      ...(input.placeholder ? { placeholder: true } : {}),
+    } as Record<string, unknown>;
   };
 
-  const findExisting = async () => {
-    const { data } = await supabase
-      .from("messages")
-      .select("id, meta")
-      .eq("workspace_id", input.workspaceId)
-      .eq("wamid", input.wamid)
-      .maybeSingle();
-    return data as { id: string; meta: Record<string, unknown> | null } | null;
+  type Existing = {
+    id: string;
+    wamid: string | null;
+    meta: Record<string, unknown> | null;
   };
 
-  // Same wamid may arrive twice (push + webhook, or webhook retries). If what
-  // we already stored is only a placeholder and we now hold the exact text,
-  // upgrade it instead of discarding the better data.
-  const reconcile = async (
-    existing: { id: string; meta: Record<string, unknown> | null },
-  ): Promise<OutboundIngestResult> => {
-    if (existing.meta?.placeholder === true && !input.placeholder) {
-      await supabase
+  // A message can be reported more than once under different ids: the sender
+  // pushes it by ycloudId, then the status webhook brings the wamid (or the
+  // webhook gets there first and the push follows). Look by both.
+  const findExisting = async (): Promise<Existing | null> => {
+    if (wamid) {
+      const { data } = await supabase
         .from("messages")
-        .update({ body: input.body, meta })
-        .eq("id", existing.id);
-      return { conversationId, messageId: existing.id, created: false, upgraded: true };
+        .select("id, wamid, meta")
+        .eq("workspace_id", input.workspaceId)
+        .eq("wamid", wamid)
+        .limit(1)
+        .maybeSingle();
+      if (data) return data as Existing;
     }
-    return { conversationId, messageId: existing.id, created: false, upgraded: false };
+    if (ycloudId) {
+      const { data } = await supabase
+        .from("messages")
+        .select("id, wamid, meta")
+        .eq("workspace_id", input.workspaceId)
+        .contains("meta", { ycloud_id: ycloudId })
+        .limit(1)
+        .maybeSingle();
+      if (data) return data as Existing;
+    }
+    return null;
+  };
+
+  // If what we already stored is only a placeholder and we now hold the exact
+  // text, upgrade it instead of discarding the better data; also fill in a
+  // wamid the existing row was still missing.
+  const reconcile = async (existing: Existing): Promise<OutboundIngestResult> => {
+    const patch: Record<string, unknown> = {};
+    if (!existing.wamid && wamid) patch.wamid = wamid;
+    if (existing.meta?.placeholder === true && !input.placeholder) {
+      patch.body = input.body;
+      patch.meta = buildMeta(existing.meta);
+    } else if (ycloudId && !existing.meta?.ycloud_id) {
+      patch.meta = { ...(existing.meta ?? {}), ycloud_id: ycloudId };
+    }
+
+    if (Object.keys(patch).length > 0) {
+      let { error } = await supabase.from("messages").update(patch).eq("id", existing.id);
+      if (error?.code === "23505" && patch.wamid) {
+        // Another row already owns that wamid — keep the rest of the patch.
+        delete patch.wamid;
+        if (Object.keys(patch).length > 0) {
+          ({ error } = await supabase.from("messages").update(patch).eq("id", existing.id));
+        }
+      }
+      if (error && error.code !== "23505") {
+        throw new Error(`[outbound-ingest] message update failed: ${error.message}`);
+      }
+    }
+    return {
+      conversationId,
+      messageId: existing.id,
+      created: false,
+      upgraded: patch.body !== undefined,
+    };
   };
 
   const existing = await findExisting();
@@ -217,17 +274,17 @@ export async function ingestOutboundTemplate(
       // type='template' bypasses the 24h-window DB guard (and is what it is).
       type: "template",
       body: input.body,
-      wamid: input.wamid,
+      wamid,
       status: input.status ?? "sent",
       sender_user_id: null,
-      meta,
+      meta: buildMeta(),
       created_at: sentAt,
     })
     .select("id")
     .single();
 
   if (error) {
-    // Lost a race with the other entry point inserting the same wamid.
+    // Lost a race with the other entry point inserting the same message.
     if (error.code === "23505") {
       const winner = await findExisting();
       if (winner) return reconcile(winner);
@@ -276,7 +333,9 @@ export async function resolveWorkspaceByBusinessPhone(
 // Webhook fallback — `whatsapp.message.updated` for a wamid we never tracked
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface StatusWhatsappMessage {
+export interface StatusWhatsappMessage {
+  /** YCloud's own message id (same one the send API returned). */
+  id?: string;
   wamid?: string;
   to?: string;
   type?: string;
@@ -340,6 +399,7 @@ export async function ingestUntrackedFromStatus(
     workspaceId,
     to: wm.to,
     wamid: wm.wamid,
+    ycloudId: wm.id ?? null,
     templateName,
     body,
     origin: "ycloud_webhook",
@@ -347,4 +407,91 @@ export async function ingestUntrackedFromStatus(
     status: status === "read" ? "read" : "delivered",
     placeholder,
   });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Adopt a pushed row when its wamid finally shows up in a status webhook
+// ──────────────────────────────────────────────────────────────────────────────
+
+type AdoptedRow = { id: string; status: string | null };
+
+/** How long after a push a status event may still be matched by template+phone. */
+const ADOPT_WINDOW_MS = 30 * 60 * 1000;
+
+/**
+ * An external sender pushes its message BEFORE the wamid exists (YCloud only
+ * reveals it in the first status webhook), so that row has `wamid = null`.
+ * When a status event arrives for an unknown wamid, find that row, store the
+ * wamid on it and hand it back — the caller then applies the status to it like
+ * to any tracked message, and the later events match by wamid directly.
+ *
+ * Matching: by YCloud's message id when the event carries it (exact);
+ * otherwise by template name + customer phone among rows pushed in the last
+ * 30 min, oldest first, since events arrive in send order.
+ */
+export async function adoptExternalOutbound(
+  workspaceId: string,
+  wm: StatusWhatsappMessage | undefined,
+): Promise<AdoptedRow | null> {
+  if (!wm?.wamid) return null;
+  const supabase = svc();
+
+  let row: AdoptedRow | null = null;
+
+  if (wm.id) {
+    const { data } = await supabase
+      .from("messages")
+      .select("id, status")
+      .eq("workspace_id", workspaceId)
+      .is("wamid", null)
+      .contains("meta", { ycloud_id: wm.id })
+      .limit(1)
+      .maybeSingle();
+    row = (data as AdoptedRow | null) ?? null;
+  } else if (wm.type === "template" && wm.template?.name && wm.to) {
+    const { data: contacts } = await supabase
+      .from("contacts")
+      .select("id")
+      .eq("workspace_id", workspaceId)
+      .in("phone", phoneVariants(wm.to));
+    const contactIds = ((contacts ?? []) as { id: string }[]).map((c) => c.id);
+
+    if (contactIds.length > 0) {
+      const { data: convs } = await supabase
+        .from("conversations")
+        .select("id")
+        .eq("workspace_id", workspaceId)
+        .eq("channel", "whatsapp")
+        .in("contact_id", contactIds);
+      const convIds = ((convs ?? []) as { id: string }[]).map((c) => c.id);
+
+      if (convIds.length > 0) {
+        const { data } = await supabase
+          .from("messages")
+          .select("id, status")
+          .eq("workspace_id", workspaceId)
+          .in("conversation_id", convIds)
+          .eq("direction", "out")
+          .eq("type", "template")
+          .is("wamid", null)
+          .contains("meta", { template_name: wm.template.name, automated: true })
+          .gte("created_at", new Date(Date.now() - ADOPT_WINDOW_MS).toISOString())
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        row = (data as AdoptedRow | null) ?? null;
+      }
+    }
+  }
+
+  if (!row) return null;
+
+  const { error } = await supabase
+    .from("messages")
+    .update({ wamid: wm.wamid })
+    .eq("id", row.id)
+    .is("wamid", null);
+  // 23505: another row already owns this wamid (a concurrent event won). Let
+  // the caller treat it as untracked; the ingest path dedups by itself.
+  return error ? null : row;
 }
