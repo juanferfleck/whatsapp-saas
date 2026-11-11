@@ -237,3 +237,50 @@ export function fillTemplateVariables(
 
   return result;
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// renderTemplateBody
+// Like fillTemplateVariables, but variables we cannot fill become "[dato]"
+// instead of leaking a raw "{{2}}" to the agent, and it reports whether every
+// placeholder was resolved. Used to store the text a customer really received.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/** Marker for a `{{n}}` whose value we could not recover. */
+const UNKNOWN_VARIABLE = "[dato]";
+
+/** Fills `{{1}}`, `{{2}}`… (`params[0]` ↔ `{{1}}`). */
+export function renderTemplateBody(
+  body: string,
+  params: string[] = [],
+): { text: string; complete: boolean } {
+  let complete = true;
+  const text = body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_m, n: string) => {
+    const value = params[Number(n) - 1];
+    if (typeof value === "string" && value.length > 0) return value;
+    complete = false;
+    return UNKNOWN_VARIABLE;
+  });
+  return { text, complete };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// loadTemplateBody
+// Body text of a workspace template by name, preferring the given language.
+// Returns null when the template isn't synced into this workspace.
+// ──────────────────────────────────────────────────────────────────────────────
+
+export async function loadTemplateBody(
+  workspaceId: string,
+  name: string,
+  language?: string,
+): Promise<string | null> {
+  const { data } = await svc()
+    .from("templates")
+    .select("language, body_template")
+    .eq("workspace_id", workspaceId)
+    .eq("name", name);
+
+  const rows = (data ?? []) as { language: string; body_template: string }[];
+  const row = rows.find((r) => r.language === language) ?? rows[0];
+  return row?.body_template || null;
+}

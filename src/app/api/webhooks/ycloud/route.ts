@@ -6,6 +6,7 @@ import {
   parseSmbEcho,
 } from "@/features/inbox/services/ycloud-webhook-handler";
 import { processInbound, processSmbEcho } from "@/features/inbox/services/normalizer";
+import { ingestUntrackedFromStatus } from "@/features/inbox/services/outbound-ingest";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   upsertBatch,
@@ -40,17 +41,33 @@ type MessageStatus = OrderedStatus | "failed";
 
 async function handleStatusUpdate(
   supabase: ReturnType<typeof svc>,
+  workspaceId: string,
+  whatsappMessage: Parameters<typeof ingestUntrackedFromStatus>[1],
   wamid: string,
   newStatus: string,
 ): Promise<void> {
   const { data: msg } = await supabase
     .from("messages")
     .select("id, status")
+    .eq("workspace_id", workspaceId)
     .eq("wamid", wamid)
-    .single();
+    .maybeSingle();
 
-  // Message not found — can happen for outbound we didn't track
-  if (!msg) return;
+  // Message not found — an outbound we didn't track: typically a template sent
+  // by another system through this same YCloud number (e.g. class booking
+  // confirmations/reminders). Record it so the agent has the context when the
+  // customer replies. Never let a failure here break the status webhook.
+  if (!msg) {
+    try {
+      await ingestUntrackedFromStatus(workspaceId, whatsappMessage, newStatus);
+    } catch (e) {
+      console.warn(
+        "[webhook] untracked outbound ingest skipped:",
+        e instanceof Error ? e.message : "unknown",
+      );
+    }
+    return;
+  }
 
   const current = msg.status as MessageStatus | null;
 
@@ -195,10 +212,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // WH-02: monotonic status updates — only reached after signature verification.
     if (isStatusUpdate) {
       const statusData = (
-        body as { whatsappMessage?: { wamid?: string; status?: string } }
+        body as {
+          whatsappMessage?: { wamid?: string; status?: string } & NonNullable<
+            Parameters<typeof ingestUntrackedFromStatus>[1]
+          >;
+        }
       ).whatsappMessage;
       if (statusData?.wamid && statusData?.status) {
-        await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
+        await handleStatusUpdate(
+          supabase,
+          ws.workspace_id as string,
+          statusData,
+          statusData.wamid,
+          statusData.status,
+        );
       }
       return NextResponse.json({ received: true });
     }
