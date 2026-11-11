@@ -31,6 +31,65 @@ export function normalizePhone(
   return `+${digits}`;
 }
 
+/**
+ * All E.164 spellings the same customer may arrive with. WhatsApp reports
+ * Argentine mobiles as 54 9 XXXXXXXXXX or 54 XXXXXXXXXX, and Mexican ones as
+ * 52 1 XXXXXXXXXX or 52 XXXXXXXXXX, depending on the API/direction. The first
+ * element is the canonical spelling of the input.
+ */
+export function phoneVariants(phone: string): string[] {
+  const digits = phone.replace(/\D/g, "");
+  const out = [`+${digits}`];
+  const swap = (cc: string, mobilePrefix: string) => {
+    const withPrefix = cc + mobilePrefix;
+    if (digits.startsWith(withPrefix) && digits.length === withPrefix.length + 10) {
+      out.push(`+${cc}${digits.slice(withPrefix.length)}`);
+    } else if (
+      digits.startsWith(cc) &&
+      !digits.startsWith(withPrefix) &&
+      digits.length === cc.length + 10
+    ) {
+      out.push(`+${withPrefix}${digits.slice(cc.length)}`);
+    }
+  };
+  swap("54", "9");
+  swap("52", "1");
+  return out;
+}
+
+/** True when two phone strings are the same number under any known spelling. */
+export function samePhone(a: string, b: string): boolean {
+  const bs = new Set(phoneVariants(b));
+  return phoneVariants(a).some((v) => bs.has(v));
+}
+
+/**
+ * If this customer already exists under another spelling of the same number
+ * (e.g. created as +549… by an outbound notification, now writing from +54…),
+ * returns the spelling that is already stored so the contact upsert hits the
+ * existing row instead of creating a duplicate — a duplicate would split the
+ * conversation and the agent would lose its context. Otherwise returns `phone`.
+ */
+export async function resolveStoredPhone(
+  supabase: ReturnType<typeof svc>,
+  workspaceId: string,
+  phone: string,
+): Promise<string> {
+  const variants = phoneVariants(phone);
+  if (variants.length === 1) return phone; // no alternate spelling exists
+
+  const { data } = await supabase
+    .from("contacts")
+    .select("phone")
+    .eq("workspace_id", workspaceId)
+    .in("phone", variants);
+
+  const stored = ((data ?? []) as { phone: string }[])
+    .map((r) => r.phone)
+    .sort((a, b) => variants.indexOf(a) - variants.indexOf(b));
+  return stored[0] ?? phone;
+}
+
 export interface ProcessInboundResult {
   contact: ContactRow;
   conversation: ConversationRow;
@@ -62,7 +121,11 @@ export async function processInbound(
     ((biRow?.structured as { default_country_code?: string } | null)
       ?.default_country_code as string) ?? DEFAULT_COUNTRY_CODE;
 
-  const phone = normalizePhone(normalized.from, defaultCc);
+  const phone = await resolveStoredPhone(
+    supabase,
+    workspaceId,
+    normalizePhone(normalized.from, defaultCc),
+  );
 
   // 1. Upsert contact
   // A user messaging the business first is implicit opt-in for service
@@ -74,8 +137,10 @@ export async function processInbound(
       {
         workspace_id: workspaceId,
         phone,
-        // Only update name when the incoming value is non-null
-        name: normalized.customerName,
+        // Only update name when the incoming value is non-null — a missing
+        // profile name must not wipe one we already have (e.g. the name given
+        // on the booking form).
+        ...(normalized.customerName ? { name: normalized.customerName } : {}),
         opt_in: true,
         opt_in_at: new Date().toISOString(),
       },
@@ -203,7 +268,11 @@ export async function processSmbEcho(
     ((biRow?.structured as { default_country_code?: string } | null)
       ?.default_country_code as string) ?? DEFAULT_COUNTRY_CODE;
 
-  const phone = normalizePhone(normalized.to, defaultCc);
+  const phone = await resolveStoredPhone(
+    supabase,
+    workspaceId,
+    normalizePhone(normalized.to, defaultCc),
+  );
 
   const { data: contactData, error: contactError } = await supabase
     .from("contacts")

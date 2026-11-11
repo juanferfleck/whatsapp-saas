@@ -9,6 +9,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { sendText, sendTemplate } from "./ycloud-client";
 import type { TemplateParams } from "./ycloud-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
+import { loadTemplateBody, renderTemplateBody } from "./templates";
 
 function svc() {
   return createSbClient(
@@ -338,13 +339,29 @@ export async function dispatchTemplate(
     }
   }
 
-  // 4. Persist template message — type='template' bypasses DB trigger
+  // 4. Persist template message — type='template' bypasses DB trigger.
+  // Store the text the customer actually received (not just the template
+  // name): the agent's conversation history is built from `body`, so a bare
+  // name would leave it blind to what was said. Falls back to the name when the
+  // template isn't synced into this workspace.
+  const templateBody = await loadTemplateBody(
+    workspaceId,
+    templateName,
+    templateLanguage,
+  );
+  const bodyParams = (components?.find((c) => c.type === "body")?.parameters ?? []).map(
+    (p) => p.text,
+  );
+  const storedBody = templateBody
+    ? renderTemplateBody(templateBody, bodyParams).text
+    : templateName;
+
   const { error: insertError } = await supabase.from("messages").insert({
     workspace_id: workspaceId,
     conversation_id: conversationId,
     direction: "out",
     type: "template",
-    body: templateName,
+    body: storedBody,
     wamid: wamid ?? null,
     status: wamid ? "queued" : "queued",
     sender_user_id: senderUserId ?? null,
@@ -355,7 +372,10 @@ export async function dispatchTemplate(
     },
   });
 
-  if (insertError) {
+  // 23505 = the status webhook already recorded this wamid before we got here
+  // (see ingestUntrackedFromStatus). The template WAS sent and is persisted, so
+  // that is not a failure.
+  if (insertError && insertError.code !== "23505") {
     console.error("[dispatch] template insert error:", insertError.message);
     return { ok: false, error: insertError.message };
   }

@@ -1,4 +1,4 @@
-import { PenLine, Bot, Smartphone } from "lucide-react";
+import { PenLine, Bot, Smartphone, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { MessageRow } from "@/features/inbox/types";
 import { StatusIcon } from "./status-icon";
@@ -18,6 +18,18 @@ function OutboundAuthor({ message }: { message: MessageRow }) {
       <span className="inline-flex items-center gap-0.5 rounded bg-foreground/10 px-1 text-[9px] font-semibold uppercase tracking-wide text-foreground/70">
         <Smartphone className="h-2.5 w-2.5" aria-hidden="true" />
         WhatsApp
+      </span>
+    );
+  }
+
+  // Sent by another system through the same number (e.g. booking confirmations
+  // and reminders) — not the AI and not a person. Like the case above it has no
+  // sender_user_id, so it must be checked before the AI fallback.
+  if ((message.meta as Record<string, unknown> | null)?.source === "external_automation") {
+    return (
+      <span className="inline-flex items-center gap-0.5 rounded bg-foreground/10 px-1 text-[9px] font-semibold uppercase tracking-wide text-foreground/70">
+        <Zap className="h-2.5 w-2.5" aria-hidden="true" />
+        Automático
       </span>
     );
   }
