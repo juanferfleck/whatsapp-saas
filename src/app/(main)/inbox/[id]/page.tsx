@@ -47,15 +47,17 @@ export default async function InboxDetailPage({ params }: PageProps) {
 
   const convWithContact = convData as ConversationRow & { contact: ContactRow };
 
-  // 4. Fetch messages (ASC, limit 100)
+  // 4. Fetch the 100 most recent messages, then put them in chronological
+  // order. Ordering ASC with a limit would return the OLDEST 100, hiding every
+  // new message once a conversation passes 100.
   const { data: messagesData } = await supabase
     .from("messages")
     .select("*, sender:users!sender_user_id(full_name, avatar_url)")
     .eq("conversation_id", id)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(100);
 
-  const messages = (messagesData ?? []) as MessageRow[];
+  const messages = ((messagesData ?? []) as MessageRow[]).reverse();
 
   // 5. Fetch sidebar conversations (same workspace, for InboxLayout)
   let sidebarConversations: ConversationWithContact[] = [];
