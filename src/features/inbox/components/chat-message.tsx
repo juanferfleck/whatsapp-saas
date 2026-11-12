@@ -115,7 +115,12 @@ export function ChatMessage({ message }: ChatMessageProps) {
             : "bg-muted/50 rounded-tl-sm",
         )}
       >
-        {message.type !== "text" && message.type !== "system" ? (
+        {/* Templates carry their rendered text in `body` and have no media, so
+            they render like text — sending them to MessageAttachment would
+            leave them stuck on "Descargando archivo…". */}
+        {message.type !== "text" &&
+        message.type !== "system" &&
+        message.type !== "template" ? (
           <MessageAttachment media={message.meta} type={message.type} />
         ) : (
           message.body && (
