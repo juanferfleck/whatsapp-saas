@@ -3,13 +3,46 @@
  *
  * ONLY dispatchText and dispatchTemplate should call sendText / sendTemplate.
  * No other module should invoke those functions directly for user-facing sends.
+ *
+ * Every send follows the same order: the outbound row is inserted as 'queued'
+ * FIRST, then the provider is called, then the row is updated with the result.
+ * - The 24h guard (trg_messages_24h_window) fires on that insert, so a message
+ *   outside the window is refused before it is sent — never sent and then
+ *   left unrecorded.
+ * - A database error before the send means nothing left: it is retryable.
+ * - After an accepted send the row already exists, so a failed update still
+ *   leaves the message visible in the inbox.
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { sendText, sendTemplate } from "./ycloud-client";
-import type { TemplateParams } from "./ycloud-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
+import {
+  decryptWhatsAppCredentials,
+  loadWhatsAppIntegration,
+  WHATSAPP_NOT_CONNECTED,
+} from "./whatsapp-provider";
+import {
+  whatsappSender,
+  WhatsAppConfigError,
+  type SendResult,
+  type TemplateComponents,
+  type WhatsAppSender,
+} from "./whatsapp-sender";
 import { loadTemplateBody, renderTemplateBody } from "./templates";
+import { YCloudError } from "./ycloud-client";
+import { KapsoError } from "./kapso-client";
+import {
+  parseWhatsAppError,
+  formatErrorForLog,
+  recordMessageError,
+  wasNotAccepted,
+  GENERIC_SEND_ERROR,
+  UNCONFIRMED_SEND_ERROR,
+  RETRY_PENDING_SEND_ERROR,
+  WINDOW_EXPIRED_MESSAGE,
+  OPT_OUT_MESSAGE,
+  type WhatsAppError,
+} from "./whatsapp-errors";
 
 function svc() {
   return createSbClient(
@@ -17,6 +50,8 @@ function svc() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
 }
+
+type Db = ReturnType<typeof svc>;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Parameter interfaces
@@ -30,6 +65,23 @@ export interface DispatchTextParams {
   senderUserId?: string;
   /** Admin bypass for expired window — triggers a WINDOW_OVERRIDE DB log */
   overrideAdmin?: boolean;
+  /**
+   * When false, a failure WhatsApp is known not to have accepted (rate limits)
+   * is returned as `retryable`, and its row is marked failed with
+   * `meta.not_accepted` and a "will retry" reason instead of the final one:
+   * the caller will send the same text again, and its earlier-send check
+   * skips such rows. The buffer passes false on every attempt but its last.
+   */
+  recordRetryableFailure?: boolean;
+  /**
+   * For system sends (the AI's reply): when the message is not sent because
+   * of the 24h window or an opt-out, leave an internal note in the thread with
+   * the text, so the team sees what the contact did not get. A person sending
+   * from the composer already sees the error, so it defaults to false.
+   */
+  noteWhenBlocked?: boolean;
+  /** Extra keys for the outbound row's meta (e.g. the buffer's batch_id). */
+  meta?: Record<string, unknown>;
 }
 
 export interface DispatchTemplateParams {
@@ -38,27 +90,65 @@ export interface DispatchTemplateParams {
   templateName: string;
   /** Defaults to 'es'. NEVER use 'es_PA' — Movinsa gotcha */
   templateLanguage?: string;
-  components?: TemplateParams["components"];
+  components?: TemplateComponents;
   senderUserId?: string;
 }
 
 export interface DispatchResult {
   ok: boolean;
   wamid?: string;
+  /** Spanish text for the team. Never provider detail. */
   error?: string;
+  /** Stable code for callers to branch on — never parse `error`. */
+  errorCode?:
+    | "WINDOW_EXPIRED"
+    | "OPT_OUT"
+    | "SEND_FAILED"
+    | "DB_ERROR"
+    | "NOT_FOUND";
+  /**
+   * True only when nothing was sent — WhatsApp refused it for a reason that
+   * clears with time (rate limits), or the database failed before the send —
+   * so sending the same text again cannot duplicate it.
+   */
+  retryable?: boolean;
+}
+
+/**
+ * Translates a failed send. Provider errors carry the whole response body
+ * (Meta's code sits inside it); a missing setting already names itself in
+ * Spanish; anything else is a network-level failure (or our own timeout)
+ * where the message may or may not have left.
+ */
+function toWhatsAppError(sendErr: unknown): WhatsAppError {
+  if (sendErr instanceof YCloudError || sendErr instanceof KapsoError) {
+    return parseWhatsAppError(sendErr.body, sendErr.status);
+  }
+  if (sendErr instanceof WhatsAppConfigError) {
+    return {
+      code: null,
+      message: sendErr.message,
+      retryable: false,
+      detail: null,
+      source: "unknown",
+      httpStatus: null,
+      fbtraceId: null,
+    };
+  }
+  return {
+    ...parseWhatsAppError(null),
+    message: UNCONFIRMED_SEND_ERROR,
+    detail: sendErr instanceof Error ? sendErr.message : String(sendErr),
+  };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface IntegrationRow {
-  credentials: Record<string, unknown>;
-  config: Record<string, unknown>;
-}
-
 interface ContactPhoneRow {
   phone: string;
+  opt_in: boolean | null;
 }
 
 interface ConversationWindowRow {
@@ -66,61 +156,271 @@ interface ConversationWindowRow {
   contact_id: string;
 }
 
-async function loadIntegration(
-  workspaceId: string,
-  supabase: ReturnType<typeof svc>,
-): Promise<{ apiKey: string; fromPhone: string }> {
-  const { data, error } = await supabase
-    .from("integrations")
-    .select("credentials, config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .eq("enabled", true)
-    .single();
-
-  if (error || !data) {
-    throw new Error(
-      `[dispatch] YCloud integration not found: ${error?.message}`,
-    );
+/**
+ * The sender for the workspace's active WhatsApp provider (YCloud or Kapso).
+ * dispatch never names a provider itself.
+ */
+async function loadSender(workspaceId: string, supabase: Db): Promise<WhatsAppSender> {
+  const row = await loadWhatsAppIntegration(supabase, workspaceId);
+  if (!row) {
+    throw new Error(`[dispatch] ${WHATSAPP_NOT_CONNECTED}`);
   }
-
-  const row = data as IntegrationRow;
-  return {
-    apiKey: (row.credentials.ycloud_api_key as string | undefined) ?? "",
-    fromPhone: (row.config.phone_number as string | undefined) ?? "",
-  };
+  const credentials = await decryptWhatsAppCredentials(row, workspaceId);
+  return whatsappSender(row.provider, credentials, row.config);
 }
 
+/**
+ * Loads the conversation window and the contact's phone/opt-in, scoped to
+ * `workspaceId`. This runs with the service role (no RLS), so the tenant
+ * filter must live here: without it a conversationId from another workspace
+ * would load and its contact would receive the message with this workspace's
+ * credentials. Returns null when the conversation or contact is not in the
+ * workspace; throws only on a database error.
+ */
 async function loadConversationAndPhone(
   conversationId: string,
-  supabase: ReturnType<typeof svc>,
-): Promise<{ window_expires_at: string | null; toPhone: string }> {
+  workspaceId: string,
+  supabase: Db,
+): Promise<{
+  window_expires_at: string | null;
+  toPhone: string;
+  optIn: boolean;
+} | null> {
   const { data: conv, error: convError } = await supabase
     .from("conversations")
     .select("window_expires_at, contact_id")
     .eq("id", conversationId)
-    .single();
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
 
-  if (convError || !conv) {
-    throw new Error(`[dispatch] conversation not found: ${convError?.message}`);
+  if (convError) {
+    throw new Error(`[dispatch] conversation lookup failed: ${convError.message}`);
   }
+  if (!conv) return null;
 
   const convRow = conv as ConversationWindowRow;
 
   const { data: contact, error: contactError } = await supabase
     .from("contacts")
-    .select("phone")
+    .select("phone, opt_in")
     .eq("id", convRow.contact_id)
-    .single();
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
 
-  if (contactError || !contact) {
-    throw new Error(`[dispatch] contact not found: ${contactError?.message}`);
+  if (contactError) {
+    throw new Error(`[dispatch] contact lookup failed: ${contactError.message}`);
   }
+  if (!contact) return null;
 
+  const contactRow = contact as ContactPhoneRow;
   return {
     window_expires_at: convRow.window_expires_at,
-    toPhone: (contact as ContactPhoneRow).phone,
+    toPhone: contactRow.phone,
+    optIn: contactRow.opt_in !== false,
   };
+}
+
+const NOT_FOUND: DispatchResult = {
+  ok: false,
+  error: "No se encontró la conversación.",
+  errorCode: "NOT_FOUND",
+};
+const OPT_OUT: DispatchResult = {
+  ok: false,
+  error: OPT_OUT_MESSAGE,
+  errorCode: "OPT_OUT",
+};
+const WINDOW_EXPIRED: DispatchResult = {
+  ok: false,
+  error: WINDOW_EXPIRED_MESSAGE,
+  errorCode: "WINDOW_EXPIRED",
+};
+
+/**
+ * A system send that never left (24h window, opt-out): an internal note in
+ * the thread says so and keeps the text, which the team can still deliver
+ * with a template. The 24h guard lets internal notes through.
+ */
+async function noteBlockedSend(
+  supabase: Db,
+  workspaceId: string,
+  conversationId: string,
+  reason: string,
+  body: string,
+): Promise<void> {
+  const { error } = await supabase.from("messages").insert({
+    workspace_id: workspaceId,
+    conversation_id: conversationId,
+    direction: "out",
+    type: "system",
+    body: `No se envió esta respuesta: ${reason}\n\n${body}`,
+    status: "sent",
+    meta: { internal: true, reason: "send_blocked" },
+  });
+  if (error) {
+    console.error("[dispatch] blocked-send note failed:", error.message);
+  }
+}
+
+/**
+ * A send that could not even find its conversation: there is no thread to
+ * leave a note in, so it goes to the workspace's events.
+ */
+async function logNotFound(
+  supabase: Db,
+  workspaceId: string,
+  conversationId: string,
+): Promise<void> {
+  await supabase
+    .from("events")
+    .insert({
+      type: "outbound_not_sent",
+      level: "warn",
+      workspace_id: workspaceId,
+      payload: { reason: "conversation_not_found", conversation_id: conversationId },
+    })
+    .then(
+      () => {},
+      () => {},
+    );
+}
+
+/**
+ * Sends one already-queued outbound row and records the outcome on it. The row
+ * was inserted before the call, so it exists whatever happens afterwards.
+ */
+async function sendQueuedRow(opts: {
+  supabase: Db;
+  sender: WhatsAppSender;
+  workspaceId: string;
+  rowId: string;
+  rowMeta: Record<string, unknown>;
+  send: () => Promise<SendResult>;
+  what: string;
+  /** False: a not-accepted failure is marked as such; the caller re-sends. */
+  recordRetryableFailure: boolean;
+}): Promise<DispatchResult> {
+  const { supabase, sender, workspaceId, rowId, rowMeta } = opts;
+
+  let sent: SendResult;
+  try {
+    sent = await opts.send();
+  } catch (sendErr) {
+    const waError = toWhatsAppError(sendErr);
+    const retryable = wasNotAccepted(waError);
+    // Technical detail: ONLY here, never in a response or the browser.
+    console.error(
+      `[dispatch] ${sender.label} ${opts.what} error:`,
+      formatErrorForLog(waError),
+    );
+
+    if (retryable && !opts.recordRetryableFailure) {
+      // Nothing left; the caller sends the same text again. The row stays (a
+      // deleted row would linger in open inboxes, which only hear inserts and
+      // updates), marked so the retry doesn't take it for a message sent. A
+      // row left 'queued' would read as a possible send and block the retry:
+      // if it can't be marked, it is deleted — a ghost bubble is the lesser harm.
+      let marked = false;
+      for (let attempt = 0; attempt < 2 && !marked; attempt++) {
+        const { error: markError } = await supabase
+          .from("messages")
+          .update({
+            status: "failed",
+            error_message: RETRY_PENDING_SEND_ERROR,
+            meta: { ...rowMeta, not_accepted: true },
+          })
+          .eq("id", rowId)
+          .eq("workspace_id", workspaceId);
+        marked = !markError;
+        if (markError) {
+          console.error("[dispatch] not-accepted update error:", markError.message);
+        }
+      }
+      if (!marked) {
+        await supabase
+          .from("messages")
+          .delete()
+          .eq("id", rowId)
+          .eq("workspace_id", workspaceId);
+      }
+    } else {
+      const { error: failError } = await supabase
+        .from("messages")
+        .update({ status: "failed", error_message: waError.message })
+        .eq("id", rowId)
+        .eq("workspace_id", workspaceId);
+      if (failError) {
+        console.error("[dispatch] failed-status update error:", failError.message);
+      }
+      await recordMessageError(supabase, waError, workspaceId, rowId);
+    }
+
+    return {
+      ok: false,
+      error: waError.message,
+      errorCode: "SEND_FAILED",
+      retryable,
+    };
+  }
+
+  // Accepted by the provider: from here on the message exists for the
+  // contact, so a failed update must not read as a failed send.
+  const patch = {
+    status: "sent",
+    wamid: sent.wamid ?? null,
+    meta: {
+      ...rowMeta,
+      // YCloud's own message id, kept to reconcile its status webhooks.
+      ycloud_id: sender.provider === "ycloud" ? sent.providerMessageId : undefined,
+    },
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { error } = await supabase
+      .from("messages")
+      .update(patch)
+      .eq("id", rowId)
+      .eq("workspace_id", workspaceId);
+    if (!error) return { ok: true, wamid: sent.wamid };
+    if (attempt === 1) {
+      console.error("[dispatch] sent-status update error:", error.message);
+      await supabase
+        .from("events")
+        .insert({
+          type: "outbound_status_not_recorded",
+          level: "error",
+          workspace_id: workspaceId,
+          payload: { message_id: rowId, wamid: sent.wamid ?? null },
+        })
+        .then(
+          () => {},
+          () => {},
+        );
+    }
+  }
+  return { ok: true, wamid: sent.wamid };
+}
+
+/** Inserts the outbound row as 'queued'. Throws only on an unexpected error. */
+async function insertQueuedRow(
+  supabase: Db,
+  row: Record<string, unknown>,
+): Promise<{ id: string } | { error: string }> {
+  const { data, error } = await supabase
+    .from("messages")
+    .insert({ ...row, status: "queued" })
+    .select("id")
+    .single();
+  if (error || !data) {
+    return { error: error?.message ?? "insert returned no row" };
+  }
+  return { id: data.id as string };
+}
+
+async function touchConversation(supabase: Db, conversationId: string): Promise<void> {
+  await supabase
+    .from("conversations")
+    .update({ last_message_at: new Date().toISOString() })
+    .eq("id", conversationId);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -135,43 +435,34 @@ export async function dispatchText(
     body: rawBody,
     senderUserId,
     overrideAdmin = false,
+    recordRetryableFailure = true,
+    noteWhenBlocked = false,
   } = params;
 
   // Normalise Markdown → WhatsApp formatting (e.g. **bold** → *bold*) once, so
-  // both the YCloud send and the persisted message match what the user receives.
+  // both the provider send and the persisted message match what the user receives.
   const body = formatWhatsAppMarkdown(rawBody);
 
   const supabase = svc();
 
-  // 1. Load conversation window + contact phone
-  const { window_expires_at, toPhone } = await loadConversationAndPhone(
+  // 1. Load conversation window + contact phone (scoped to the workspace)
+  const loaded = await loadConversationAndPhone(
     conversationId,
+    workspaceId,
     supabase,
   );
+  if (!loaded) {
+    if (noteWhenBlocked) await logNotFound(supabase, workspaceId, conversationId);
+    return NOT_FOUND;
+  }
+  const { window_expires_at, toPhone } = loaded;
 
   // SEC-10: Block outbound to opted-out contacts
-  const { data: convRow } = await supabase
-    .from("conversations")
-    .select("contact_id")
-    .eq("id", conversationId)
-    .single();
-
-  if (convRow) {
-    const { data: contactOptData } = await supabase
-      .from("contacts")
-      .select("opt_in")
-      .eq("id", (convRow as { contact_id: string }).contact_id)
-      .single();
-
-    if (
-      contactOptData &&
-      (contactOptData as { opt_in: boolean }).opt_in === false
-    ) {
-      return {
-        ok: false,
-        error: "OPT_OUT: contact has opted out of WhatsApp messages",
-      };
+  if (!loaded.optIn) {
+    if (noteWhenBlocked) {
+      await noteBlockedSend(supabase, workspaceId, conversationId, OPT_OUT_MESSAGE, body);
     }
+    return OPT_OUT;
   }
 
   // 2. App-level 24h window guard (DB trigger is the final enforcer)
@@ -180,84 +471,80 @@ export async function dispatchText(
     new Date() > new Date(window_expires_at) &&
     !overrideAdmin
   ) {
-    return { ok: false, error: "WINDOW_EXPIRED" };
-  }
-
-  // 3. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
-
-  // 4. Send via YCloud (skip if placeholder / dev mode)
-  // YCloud returns its own `id` synchronously and assigns the WhatsApp `wamid`
-  // asynchronously (delivered via a status webhook). A 2xx response means the
-  // message was accepted for delivery, even when `wamid` is still empty.
-  let wamid: string | undefined;
-  let ycloudId: string | undefined;
-  const realSend = Boolean(apiKey && apiKey !== "placeholder");
-
-  if (realSend) {
-    try {
-      const sent = await sendText({
-        apiKey,
-        from: fromPhone,
-        to: toPhone,
+    if (noteWhenBlocked) {
+      await noteBlockedSend(
+        supabase,
+        workspaceId,
+        conversationId,
+        WINDOW_EXPIRED_MESSAGE,
         body,
-      });
-      wamid = sent.wamid || undefined;
-      ycloudId = sent.id || undefined;
-    } catch (sendErr) {
-      const errMsg =
-        sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendText error:", errMsg);
-
-      // Persist failed message for audit
-      await supabase.from("messages").insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        direction: "out",
-        type: "text",
-        body,
-        status: "failed",
-        sender_user_id: senderUserId ?? null,
-        meta: { error: errMsg, override_admin: overrideAdmin || undefined },
-      });
-
-      return { ok: false, error: errMsg };
+      );
     }
+    return WINDOW_EXPIRED;
   }
 
-  // 5. Persist outbound message
-  // The DB trigger trg_messages_24h_window fires here — if override_admin is set
-  // and window is expired, the trigger logs WINDOW_OVERRIDE and allows the insert.
-  const { error: insertError } = await supabase.from("messages").insert({
+  // 3. Resolve the workspace's WhatsApp provider
+  const sender = await loadSender(workspaceId, supabase);
+  const rowMeta: Record<string, unknown> = {
+    ...(params.meta ?? {}),
+    dev_mode: sender.live ? undefined : true,
+    override_admin: overrideAdmin || undefined,
+  };
+
+  // 4. Queue the row. The DB trigger trg_messages_24h_window fires here: with
+  // override_admin and an expired window it logs WINDOW_OVERRIDE and allows it.
+  const queued = await insertQueuedRow(supabase, {
     workspace_id: workspaceId,
     conversation_id: conversationId,
     direction: "out",
     type: "text",
     body,
-    wamid: wamid ?? null,
-    // A real YCloud send is 'sent'; only a placeholder key stays a dev no-op.
-    status: realSend ? "sent" : "queued",
     sender_user_id: senderUserId ?? null,
-    meta: {
-      dev_mode: realSend ? undefined : true,
-      ycloud_id: ycloudId,
-      override_admin: overrideAdmin || undefined,
-    },
+    meta: rowMeta,
   });
-
-  if (insertError) {
-    // Surface DB trigger errors (WINDOW_EXPIRED raised by trigger)
-    console.error("[dispatch] message insert error:", insertError.message);
-    return { ok: false, error: insertError.message };
+  if ("error" in queued) {
+    console.error("[dispatch] message insert error:", queued.error);
+    if (queued.error.includes("WINDOW_EXPIRED")) {
+      if (noteWhenBlocked) {
+        await noteBlockedSend(
+          supabase,
+          workspaceId,
+          conversationId,
+          WINDOW_EXPIRED_MESSAGE,
+          body,
+        );
+      }
+      return WINDOW_EXPIRED;
+    }
+    // Nothing was sent: safe to try again.
+    return {
+      ok: false,
+      error: GENERIC_SEND_ERROR,
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
   }
 
-  // 6. Refresh conversation last_message_at
-  await supabase
-    .from("conversations")
-    .update({ last_message_at: new Date().toISOString() })
-    .eq("id", conversationId);
+  // 5. Dev mode (placeholder key): the queued row is the whole record.
+  if (!sender.live) {
+    await touchConversation(supabase, conversationId);
+    return { ok: true };
+  }
 
-  return { ok: true, wamid };
+  // 6. Send and record the outcome on the row
+  const result = await sendQueuedRow({
+    supabase,
+    sender,
+    workspaceId,
+    rowId: queued.id,
+    rowMeta,
+    send: () => sender.sendText(toPhone, body),
+    what: "sendText",
+    recordRetryableFailure,
+  });
+
+  if (result.ok) await touchConversation(supabase, conversationId);
+  return result;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -278,71 +565,26 @@ export async function dispatchTemplate(
   const supabase = svc();
 
   // 1. Load contact phone (templates bypass the window guard entirely)
-  const { toPhone } = await loadConversationAndPhone(conversationId, supabase);
+  const loaded = await loadConversationAndPhone(
+    conversationId,
+    workspaceId,
+    supabase,
+  );
+  if (!loaded) return NOT_FOUND;
+  const { toPhone } = loaded;
 
   // SEC-10: Block outbound to opted-out contacts
-  const { data: tplConvRow } = await supabase
-    .from("conversations")
-    .select("contact_id")
-    .eq("id", conversationId)
-    .single();
+  if (!loaded.optIn) return OPT_OUT;
 
-  if (tplConvRow) {
-    const { data: tplOptData } = await supabase
-      .from("contacts")
-      .select("opt_in")
-      .eq("id", (tplConvRow as { contact_id: string }).contact_id)
-      .single();
+  // 2. Resolve the workspace's WhatsApp provider
+  const sender = await loadSender(workspaceId, supabase);
+  const rowMeta: Record<string, unknown> = {
+    template_name: templateName,
+    template_language: templateLanguage,
+    dev_mode: sender.live ? undefined : true,
+  };
 
-    if (tplOptData && (tplOptData as { opt_in: boolean }).opt_in === false) {
-      return {
-        ok: false,
-        error: "OPT_OUT: contact has opted out of WhatsApp messages",
-      };
-    }
-  }
-
-  // 2. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
-
-  // 3. Send template via YCloud
-  let wamid: string | undefined;
-
-  if (apiKey && apiKey !== "placeholder") {
-    try {
-      const sent = await sendTemplate({
-        apiKey,
-        from: fromPhone,
-        to: toPhone,
-        templateName,
-        language: templateLanguage,
-        components,
-      });
-      // YCloud returns its `id` on send and assigns the wamid later; an empty
-      // string would collide on the UNIQUE (workspace_id, wamid) of the next send.
-      wamid = sent.wamid || undefined;
-    } catch (sendErr) {
-      const errMsg =
-        sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendTemplate error:", errMsg);
-
-      await supabase.from("messages").insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        direction: "out",
-        type: "template",
-        body: templateName,
-        status: "failed",
-        sender_user_id: senderUserId ?? null,
-        meta: { error: errMsg, template_name: templateName },
-      });
-
-      return { ok: false, error: errMsg };
-    }
-  }
-
-  // 4. Persist template message — type='template' bypasses DB trigger.
-  // Store the text the customer actually received (not just the template
+  // Store the text the customer actually receives (not just the template
   // name): the agent's conversation history is built from `body`, so a bare
   // name would leave it blind to what was said. Falls back to the name when the
   // template isn't synced into this workspace.
@@ -351,42 +593,56 @@ export async function dispatchTemplate(
     templateName,
     templateLanguage,
   );
-  const bodyParams = (components?.find((c) => c.type === "body")?.parameters ?? []).map(
-    (p) => p.text,
-  );
+  const bodyParams = (
+    components?.find((c) => c.type === "body")?.parameters ?? []
+  ).map((p) => p.text);
   const storedBody = templateBody
     ? renderTemplateBody(templateBody, bodyParams).text
     : templateName;
 
-  const { error: insertError } = await supabase.from("messages").insert({
+  // 3. Queue the row — type='template' bypasses the 24h trigger
+  const queued = await insertQueuedRow(supabase, {
     workspace_id: workspaceId,
     conversation_id: conversationId,
     direction: "out",
     type: "template",
     body: storedBody,
-    wamid: wamid ?? null,
-    status: wamid ? "queued" : "queued",
     sender_user_id: senderUserId ?? null,
-    meta: {
-      template_name: templateName,
-      template_language: templateLanguage,
-      dev_mode: !wamid || undefined,
-    },
+    meta: rowMeta,
   });
-
-  // 23505 = the status webhook already recorded this wamid before we got here
-  // (see ingestUntrackedFromStatus). The template WAS sent and is persisted, so
-  // that is not a failure.
-  if (insertError && insertError.code !== "23505") {
-    console.error("[dispatch] template insert error:", insertError.message);
-    return { ok: false, error: insertError.message };
+  if ("error" in queued) {
+    console.error("[dispatch] template insert error:", queued.error);
+    return {
+      ok: false,
+      error: GENERIC_SEND_ERROR,
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
   }
 
-  // 5. Refresh conversation last_message_at
-  await supabase
-    .from("conversations")
-    .update({ last_message_at: new Date().toISOString() })
-    .eq("id", conversationId);
+  if (!sender.live) {
+    await touchConversation(supabase, conversationId);
+    return { ok: true };
+  }
 
-  return { ok: true, wamid };
+  // 4. Send and record the outcome on the row
+  const result = await sendQueuedRow({
+    supabase,
+    sender,
+    workspaceId,
+    rowId: queued.id,
+    rowMeta,
+    send: () =>
+      sender.sendTemplate({
+        to: toPhone,
+        templateName,
+        language: templateLanguage,
+        components,
+      }),
+    what: "sendTemplate",
+    recordRetryableFailure: true,
+  });
+
+  if (result.ok) await touchConversation(supabase, conversationId);
+  return result;
 }

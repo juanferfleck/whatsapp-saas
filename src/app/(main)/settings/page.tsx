@@ -4,6 +4,9 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { getActiveWorkspace } from "@/features/workspace/services/active-workspace";
 import { listAgents } from "@/features/agents/services/agent-queries";
 import { SettingsShell } from "@/features/settings/components/settings-shell";
+import { countJudgmentsToday } from "@/features/jev-judge/usage";
+import { readJevUses } from "@/features/jev-judge/uses";
+import { isWhatsAppProvider } from "@/features/inbox/services/whatsapp-provider";
 
 export default async function SettingsPage() {
   const supabase = await createClient();
@@ -34,6 +37,10 @@ export default async function SettingsPage() {
   }
 
   const workspaceId = membership.workspace_id as string;
+  // The reads below use the service role, so they must apply the RLS rule
+  // themselves: integration and tool configs are for admins and managers.
+  const canReadConfig =
+    membership.role === "admin" || membership.role === "manager";
 
   const svc = createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -63,6 +70,14 @@ export default async function SettingsPage() {
   ]);
 
   const initialAgents = await listAgents(svc, workspaceId);
+  // Jev's settings live in the workspace's active WhatsApp integration
+  // (YCloud or Kapso — at most one is enabled).
+  const whatsapp = (integrationsData ?? []).find(
+    (row) => row.enabled && isWhatsAppProvider(row.provider),
+  );
+  const whatsappConfig =
+    (whatsapp?.config as Record<string, unknown> | null) ?? {};
+  const judgmentsToday = await countJudgmentsToday(svc, workspaceId);
 
   // Mask credentials server-side before passing to client components
   function maskRecord(
@@ -74,7 +89,7 @@ export default async function SettingsPage() {
     );
   }
 
-  const maskedIntegrations = (integrationsData ?? []).map(
+  const maskedIntegrations = (canReadConfig ? (integrationsData ?? []) : []).map(
     (row: Record<string, unknown>) => ({
       provider: row.provider,
       enabled: row.enabled,
@@ -108,7 +123,9 @@ export default async function SettingsPage() {
       description: (tool.description as string | null) ?? "",
       sensitivity: (tool.sensitivity as string) ?? "read",
       enabled: enabledToolIds.has(tool.id as string),
-      config: configByToolId.get(tool.id as string) ?? null,
+      config: canReadConfig
+        ? (configByToolId.get(tool.id as string) ?? null)
+        : null,
     }),
   );
 
@@ -120,6 +137,12 @@ export default async function SettingsPage() {
       initialTools={toolsWithEnabled}
       initialIntegrations={maskedIntegrations}
       initialAgents={initialAgents}
+      jev={{
+        enabled: whatsappConfig.jev_enabled === true,
+        uses: readJevUses(whatsappConfig),
+        keyReady: Boolean(process.env.TYPESAFE_API_KEY),
+        judgmentsToday,
+      }}
     />
   );
 }

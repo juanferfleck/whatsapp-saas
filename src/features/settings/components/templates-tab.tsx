@@ -141,7 +141,7 @@ function EmptyState({
         <p className="mt-1 text-xs text-muted-foreground">
           {filtered
             ? "Prueba con otro filtro."
-            : "Crea una nueva, usa la biblioteca o sincroniza desde YCloud."}
+            : "Crea una nueva, usa la biblioteca o sincroniza desde tu proveedor de WhatsApp."}
         </p>
       </div>
       {!filtered && (
@@ -421,11 +421,12 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
       const json = (await res.json()) as {
         synced?: number;
         errors?: number;
+        truncated?: boolean;
         error?: string;
       };
       if (!res.ok) throw new Error(json.error ?? "Error al sincronizar");
       toast.success(
-        `Sincronizadas ${json.synced ?? 0} plantillas${json.errors ? ` · ${json.errors} errores` : ""}`,
+        `Sincronizadas ${json.synced ?? 0} plantillas${json.errors ? ` · ${json.errors} errores` : ""}${json.truncated ? " · tu cuenta tiene más plantillas de las que se pudieron traer" : ""}`,
       );
       await fetchTemplates();
     } catch (err) {
@@ -435,7 +436,7 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
     }
   }
 
-  // ── Submit to YCloud ──────────────────────────────────────────────────────
+  // ── Submit to the WhatsApp provider (Meta approval) ─────────────────────
   async function handleSubmitTemplate(t: TemplateRow) {
     setSubmittingId(t.id);
     try {
@@ -542,7 +543,7 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
                   className={cn("mr-2 h-4 w-4", isSyncing && "animate-spin")}
                   aria-hidden="true"
                 />
-                {isSyncing ? "Sincronizando…" : "Sincronizar desde YCloud"}
+                {isSyncing ? "Sincronizando…" : "Sincronizar plantillas"}
               </Button>
               <Button size="sm" onClick={openNew}>
                 <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
