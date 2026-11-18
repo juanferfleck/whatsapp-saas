@@ -10,6 +10,7 @@ import { AutomationsTab } from "./automations-tab";
 import { KbTab } from "./kb-tab";
 import { AgentsTab } from "@/features/agents/components/agents-tab";
 import type { AgentDto } from "@/features/agents/types";
+import type { JevSettings } from "@/features/jev-judge/components/jev-panel";
 
 interface ToolItem {
   id: string;
@@ -29,15 +30,18 @@ interface Props {
   initialIntegrations: unknown[];
   initialTemplates?: unknown[];
   initialAgents?: AgentDto[];
+  jev: JevSettings;
 }
 
 export function SettingsShell({
   workspaceId,
+  role,
   initialBusinessInfo,
   initialTools,
   initialIntegrations,
   initialTemplates = [],
   initialAgents = [],
+  jev,
 }: Props) {
   const biForForm = initialBusinessInfo as {
     structured: Record<string, unknown>;
@@ -71,6 +75,8 @@ export function SettingsShell({
             <AgentsTab
               workspaceId={workspaceId}
               initialAgents={initialAgents}
+              jev={jev}
+              canManage={role === "admin" || role === "manager"}
             />
           </div>
         </TabsContent>
@@ -79,6 +85,7 @@ export function SettingsShell({
           <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
             <IntegrationsTab
               workspaceId={workspaceId}
+              role={role}
               initialIntegrations={initialIntegrations}
             />
           </div>
@@ -94,6 +101,7 @@ export function SettingsShell({
           <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
             <ToolsCatalog
               workspaceId={workspaceId}
+              role={role}
               initialTools={initialTools}
             />
           </div>

@@ -3,6 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { encryptCredentials } from "@/shared/lib/integration-secrets";
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -11,9 +12,12 @@ export const OnboardingSchema = z.object({
   businessName: z.string().min(1, "El nombre del negocio es requerido"),
   industry: z.string().optional(),
   description: z.string().optional(),
-  ycloudApiKey: z.string().optional(),
-  ycloudPhone: z.string().optional(),
-  ycloudSigningSecret: z.string().optional(),
+  whatsappProvider: z.enum(["ycloud", "kapso"]).default("ycloud"),
+  whatsappApiKey: z.string().optional(),
+  whatsappPhone: z.string().optional(),
+  whatsappSigningSecret: z.string().optional(),
+  kapsoPhoneNumberId: z.string().optional(),
+  kapsoWabaId: z.string().optional(),
 });
 
 export type OnboardingInput = z.infer<typeof OnboardingSchema>;
@@ -72,6 +76,25 @@ export async function completeOnboarding(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
+
+  // 3b. This action is an HTTP endpoint; the /onboarding page is not a lock.
+  //     Workspaces are created by the agency, so only a super admin may
+  //     onboard. Anyone else — a viewer, a deactivated ex-member, a client
+  //     whose workspace was deleted — must not mint an admin workspace running
+  //     on the agency's keys. A failed read is a denial, never a pass.
+  const { data: profile, error: profileError } = await serviceClient
+    .from("users")
+    .select("is_super_admin")
+    .eq("id", user.id)
+    .maybeSingle();
+
+  if (profileError) {
+    console.error("[completeOnboarding] profile check error:", profileError);
+    return { error: "No se pudo verificar tu cuenta. Intenta de nuevo." };
+  }
+  if (profile?.is_super_admin !== true) {
+    return { error: "No tienes permiso para crear un espacio de trabajo" };
+  }
 
   // 4. Generate unique slug
   const baseSlug = generateSlug(data.businessName);
@@ -229,21 +252,34 @@ export async function completeOnboarding(
     });
   }
 
-  // 9. Save YCloud integration (if credentials provided)
-  if (data.ycloudApiKey) {
+  // 9. Save the WhatsApp integration (if credentials provided) with the
+  //    provider the workspace chose: YCloud or Kapso.
+  if (data.whatsappApiKey) {
+    const provider = data.whatsappProvider;
     const { error: intError } = await serviceClient
       .from("integrations")
       .insert({
         workspace_id: workspaceId,
-        provider: "ycloud",
+        provider,
         enabled: true,
-        credentials: {
-          ycloud_api_key: data.ycloudApiKey,
-          webhook_signing_secret: data.ycloudSigningSecret ?? "",
-        },
-        config: {
-          phone_number: data.ycloudPhone ?? "",
-        },
+        credentials: await encryptCredentials(
+          {
+            [provider === "kapso" ? "kapso_api_key" : "ycloud_api_key"]:
+              data.whatsappApiKey,
+            webhook_signing_secret: data.whatsappSigningSecret ?? "",
+          },
+          workspaceId,
+          provider,
+        ),
+        config:
+          provider === "kapso"
+            ? {
+                phone_number: data.whatsappPhone ?? "",
+                // Meta's ids: phone_number_id sends, waba_id manages templates.
+                phone_number_id: data.kapsoPhoneNumberId ?? "",
+                waba_id: data.kapsoWabaId ?? "",
+              }
+            : { phone_number: data.whatsappPhone ?? "" },
         oauth_tokens: {},
       });
 

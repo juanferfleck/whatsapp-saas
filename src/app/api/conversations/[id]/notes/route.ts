@@ -1,9 +1,12 @@
-// Internal notes — stored as messages but never dispatched to YCloud.
+// Internal notes — stored as messages but never dispatched to WhatsApp.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { z } from "zod";
-import { readJsonBody } from "@/lib/auth/workspace-access";
+import {
+  readJsonBody,
+  requireWorkspaceMember,
+} from "@/lib/auth/workspace-access";
 
 const BodySchema = z.object({
   content: z.string().min(1).max(4096),
@@ -46,7 +49,14 @@ export async function POST(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  // 4. Insert internal note as a system message — NOT dispatched to YCloud
+  // 3b. RLS on messages already rejects a viewer's insert, but as a bare 500.
+  // Same bar as the composer, answered as a clean 403.
+  const auth = await requireWorkspaceMember(conv.workspace_id as string, {
+    minRole: "agent",
+  });
+  if (!auth.ok) return auth.response;
+
+  // 4. Insert internal note as a system message — NOT dispatched to WhatsApp
   const { error: insertError } = await supabase.from("messages").insert({
     workspace_id: conv.workspace_id,
     conversation_id: conversationId,

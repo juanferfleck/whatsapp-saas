@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { inboundContentText } from "./inbound-content";
 
 /**
  * Verifies a YCloud webhook signature.
@@ -63,7 +64,12 @@ export interface NormalizedInbound {
   from: string;
   /** Message type as reported by YCloud */
   type: string;
-  /** Text content, the media caption, or "[Multimedia]" when neither exists */
+  /** The provider's own message type, before clamping (e.g. "reaction"). */
+  rawType: string;
+  /**
+   * Text content, the media caption, "[Multimedia]" for media with neither, or
+   * a readable line for button/list replies, orders and locations.
+   */
   text: string | null;
   /** YCloud WhatsApp message ID */
   wamid: string;
@@ -143,10 +149,9 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
 
     const msgType = typeof wimObj.type === "string" ? wimObj.type : "unknown";
 
-    // A reaction (emoji tap on a prior message) is not a real inbound message —
-    // it carries no content for the agent to respond to. Drop it here so it
-    // never becomes a message row or reaches the buffer/AI pipeline.
-    if (msgType === "reaction") return null;
+    // A reaction (emoji tap on a prior message) is NOT dropped: the normalizer
+    // records it in the thread marked no_reply, and the route stops there, so
+    // the operator sees it and nothing ever answers it.
 
     const createTime =
       typeof event.createTime === "string"
@@ -196,13 +201,15 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       }
       if (text === null) text = "[Multimedia]";
     } else {
-      text = "[Multimedia]";
+      // Button taps, list/interactive replies, orders, locations…
+      text = inboundContentText(wimObj, msgType);
     }
 
     return {
       workspacePhone: to,
       from,
       type: toMessageType(msgType),
+      rawType: msgType,
       text,
       wamid,
       customerName,

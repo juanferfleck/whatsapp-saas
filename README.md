@@ -48,8 +48,40 @@ Supabase/Vercel.
 | Estilos   | Tailwind CSS + shadcn/ui                     |
 | Backend   | Supabase (Auth + PostgreSQL + RLS + Storage) |
 | IA        | OpenRouter (LLM gateway)                     |
-| WhatsApp  | YCloud                                       |
+| WhatsApp  | YCloud o Kapso, por workspace (ver abajo)    |
 | Hosting   | Vercel                                       |
+
+## Elegir proveedor de WhatsApp
+
+Cada **workspace** elige su proveedor en **Settings → Integraciones → WhatsApp**:
+**YCloud** o **Kapso**. Los dos viven en `main` y en la misma instalación. Una
+agencia puede tener clientes de Estados Unidos en Kapso y de Latinoamérica en
+YCloud.
+
+| | YCloud | Kapso |
+| --- | --- | --- |
+| Disponible en EE. UU. | ❌ | ✅ |
+| Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
+| Plantillas | WABA resuelto desde el número | `waba_id` configurado (se autocompleta) |
+| Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
+| Coexistence (responder desde la app en el celular) | no soportado | soportado |
+| Prueba de conexión | `GET /balance` | listado de números del proyecto |
+| Webhook | `/api/webhooks/ycloud?wsid=…` | `/api/webhooks/kapso?wsid=…` |
+
+Solo puede haber **un proveedor activo por workspace**. Al cambiarlo, el anterior
+queda guardado, desactivado, por si vuelves. Los ajustes del workspace (buffer,
+memoria, aviso de handoff, Jev) se trasladan solos, y los webhooks del proveedor
+anterior dejan de aceptarse.
+
+Con Kapso, `phone_number_id` y `waba_id` se autocompletan al pulsar «Probar
+conexión». Con **coexistence**, si el mismo número se usa también desde la app
+de WhatsApp Business en un celular, esas respuestas humanas se guardan y la
+conversación pasa a `human_active` para que el agente no conteste encima de la
+persona. Guía paso a paso: el paso 11 de [`INSTALAR.md`](INSTALAR.md).
+
+> La antigua rama `provider/kapso` quedó congelada: todo vive en `main`. Si
+> instalaste desde esa rama, cambia a `main` como indica INSTALAR.md →
+> "Actualizar".
 
 ## Desarrollo local
 
@@ -60,6 +92,12 @@ npm run dev                        # http://localhost:3000
 ```
 
 Otros comandos: `npm run build`, `npm run lint`, `npm run typecheck`.
+
+Pruebas:
+
+- `npm run test:unit` — pruebas unitarias con `node --test` (Node ≥ 22.18).
+- `supabase test db` — pruebas de seguridad de la base (pgTAP, en
+  `supabase/tests/`) contra un Supabase local (`supabase start`).
 
 ## El cron del buffer
 
@@ -81,16 +119,42 @@ supabase/
 └── cron/       # SQL post-deploy del buffer-flush
 scripts/
 ├── setup.mjs       # Orquestador de instalación (secrets, env, db, cron)
-└── seed-admin.mjs  # Super admin + workspace demo
+└── seed-admin.mjs  # Crea el super admin
 ```
 
 ## Variables de entorno
 
 Ver [`.env.local.example`](.env.local.example). Las de Supabase y OpenRouter las
 pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
-`scripts/setup.mjs`. **YCloud y HighLevel NO son env vars** — se configuran por
-workspace en Settings → Integraciones (encriptados por tenant).
+`scripts/setup.mjs`. **YCloud, Kapso y HighLevel NO son env vars** — se configuran
+por workspace en Settings → Integraciones.
+
+### Credenciales de integraciones
+
+Lo que guardas en Settings → Integraciones (API key de YCloud o Kapso, signing secret,
+PIT de HighLevel) se cifra con **AES-256-GCM** antes de tocar la base. La llave
+es `ENCRYPTION_KEY` y vive solo en el entorno del servidor: quien tenga acceso
+de lectura a Postgres ve ciphertext, no las keys.
+
+Cada valor queda ligado a su `workspace_id` + proveedor, así que un blob copiado
+de un tenant a otro no descifra.
+
+> **Si instalaste antes de esta versión**, tus credenciales están en texto plano.
+> La app las sigue leyendo, pero para cifrarlas corre:
+>
+> ```bash
+> node scripts/encrypt-credentials.mjs --dry-run   # ver qué cambiaría
+> node scripts/encrypt-credentials.mjs             # aplicar
+> ```
 
 ---
 
-_Material para miembros de Imperio Agentico._
+## Licencia
+
+[MIT](LICENSE). Puedes usar, modificar, forkear, redistribuir, vender y cobrar
+por este software, incluso con fines comerciales y sin pagar regalías. La única
+condición es conservar el aviso de copyright y el texto de la licencia en las
+copias o partes sustanciales que distribuyas. Se entrega **sin garantía**.
+
+_Nacido como material para miembros de Imperio Agentico — el código es MIT para
+cualquiera._

@@ -1,9 +1,24 @@
 /**
- * templates.ts — Template management: list, sync from YCloud, helpers.
+ * templates.ts — Template management: list, sync from the workspace's WhatsApp
+ * provider (YCloud or Kapso), helpers.
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { fetchYCloudTemplates } from "./ycloud-client";
+import {
+  fetchYCloudTemplates,
+  resolveWabaId,
+  templateOfficialId,
+} from "./ycloud-client";
+import { fetchKapsoTemplates } from "./kapso-client";
+import { phoneString } from "./phone";
+import {
+  decryptWhatsAppCredentials,
+  loadWhatsAppIntegration,
+  whatsappApiKey,
+  WHATSAPP_NOT_CONNECTED,
+  type WhatsAppProvider,
+} from "./whatsapp-provider";
+import { extractRejectionReason, templateStatusPatch } from "./template-sync";
 
 function svc() {
   return createSbClient(
@@ -40,28 +55,32 @@ export interface TemplateRow {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// YCloud API shape (raw response)
+// Meta template shape (raw response — both providers relay Meta's)
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface YCloudTemplateComponent {
+interface MetaTemplateComponent {
   type: string;
   text?: string;
   parameters?: unknown[];
   [key: string]: unknown;
 }
 
-interface YCloudTemplate {
+interface MetaTemplate {
   id?: string;
   name?: string;
   language?: string;
   category?: string;
   status?: string;
-  components?: YCloudTemplateComponent[];
+  // Why Meta rejected it: Graph (Kapso) reports `rejected_reason`, YCloud
+  // `reason`; Meta sends "NONE" when there is none.
+  rejected_reason?: string;
+  reason?: string;
+  components?: MetaTemplateComponent[];
   [key: string]: unknown;
 }
 
-// Maps YCloud status strings to our enum
-const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
+// Maps Meta status strings to our enum
+const META_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   APPROVED: "approved",
   PENDING: "submitted",
   PENDING_DELETION: "submitted",
@@ -70,12 +89,19 @@ const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   DISABLED: "paused",
 };
 
-function mapYCloudStatus(raw: string): TemplateRow["status"] {
-  return YCLOUD_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
+function mapTemplateStatus(raw: string): TemplateRow["status"] {
+  return META_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
 }
 
-// Extracts the body text from YCloud components array
-function extractBodyText(components: YCloudTemplateComponent[]): string {
+// templates.category is CHECK-constrained to lowercase; Meta reports UPPERCASE.
+const TEMPLATE_CATEGORIES = new Set(["marketing", "utility", "authentication"]);
+function normalizeCategory(raw: unknown): string {
+  const value = typeof raw === "string" ? raw.toLowerCase() : "";
+  return TEMPLATE_CATEGORIES.has(value) ? value : "utility";
+}
+
+// Extracts the body text from the Meta components array
+function extractBodyText(components: MetaTemplateComponent[]): string {
   const bodyComp = components.find((c) => c.type?.toUpperCase() === "BODY");
   return typeof bodyComp?.text === "string" ? bodyComp.text : "";
 }
@@ -110,38 +136,67 @@ export async function listTemplates(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// syncTemplatesFromYCloud
+// syncTemplates — pulls the workspace's templates from its WhatsApp provider
 // ──────────────────────────────────────────────────────────────────────────────
 
-export async function syncTemplatesFromYCloud(
-  workspaceId: string,
-): Promise<{ synced: number; errors: number }> {
-  const supabase = svc();
-
-  // 1. Load YCloud integration credentials
-  const { data: integration, error: intError } = await supabase
-    .from("integrations")
-    .select("credentials")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .eq("enabled", true)
-    .single();
-
-  if (intError || !integration) {
+async function fetchProviderTemplates(
+  provider: WhatsAppProvider,
+  apiKey: string,
+  config: Record<string, unknown>,
+): Promise<{ items: unknown[]; truncated: boolean }> {
+  if (provider === "kapso") {
+    // Kapso's template endpoints are Meta's, scoped to a WABA id in the path.
+    // It is configured per workspace — the API can't discover it without it.
+    const wabaId = (config.waba_id as string | undefined) ?? "";
+    if (!wabaId) {
+      throw new Error(
+        "[templates] falta waba_id en la configuración de Kapso del workspace",
+      );
+    }
+    return { items: await fetchKapsoTemplates(apiKey, wabaId), truncated: false };
+  }
+  // YCloud's key reaches every WABA of the account: only this number's.
+  const phoneNumber = phoneString(config.phone_number) ?? "";
+  if (!phoneNumber) {
     throw new Error(
-      `[templates] YCloud integration not found: ${intError?.message}`,
+      "[templates] falta el número de WhatsApp en la configuración de YCloud del workspace",
     );
   }
+  const wabaId = await resolveWabaId(apiKey, phoneNumber);
+  return fetchYCloudTemplates(apiKey, wabaId);
+}
 
-  const credentials = integration.credentials as Record<string, unknown>;
-  const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
+export async function syncTemplates(
+  workspaceId: string,
+): Promise<{ synced: number; errors: number; truncated: boolean }> {
+  const supabase = svc();
 
-  if (!apiKey || apiKey === "placeholder") {
-    return { synced: 0, errors: 0 };
+  // 1. Load the workspace's WhatsApp integration
+  const whatsapp = await loadWhatsAppIntegration(supabase, workspaceId);
+  if (!whatsapp) {
+    throw new Error(`[templates] ${WHATSAPP_NOT_CONNECTED}`);
   }
 
-  // 2. Fetch templates from YCloud
-  const records = await fetchYCloudTemplates(apiKey);
+  const credentials = await decryptWhatsAppCredentials(whatsapp, workspaceId);
+  const apiKey = whatsappApiKey(whatsapp.provider, credentials);
+
+  if (!apiKey || apiKey === "placeholder") {
+    return { synced: 0, errors: 0, truncated: false };
+  }
+
+  // 2. Fetch templates from the provider
+  const { items: records, truncated } = await fetchProviderTemplates(
+    whatsapp.provider,
+    apiKey,
+    whatsapp.config,
+  );
+
+  // What we already stored, by the template's identity (name + language):
+  // keeps a rejection reason Meta stops reporting, and `approved_at` on the
+  // first approval instead of every sync.
+  const previous = new Map(
+    (await listTemplates(workspaceId)).map((t) => [`${t.name}|${t.language}`, t]),
+  );
 
   let synced = 0;
   let errors = 0;
@@ -149,16 +204,17 @@ export async function syncTemplatesFromYCloud(
   // 3. Upsert each template
   for (const raw of records) {
     try {
-      const t = raw as YCloudTemplate;
+      const t = raw as MetaTemplate;
       const name = typeof t.name === "string" ? t.name : "";
       const language = typeof t.language === "string" ? t.language : "es";
-      const category = typeof t.category === "string" ? t.category : "UTILITY";
-      const status = mapYCloudStatus(
+      const category = normalizeCategory(t.category);
+      const status = mapTemplateStatus(
         typeof t.status === "string" ? t.status : "PENDING",
       );
       const components = Array.isArray(t.components) ? t.components : [];
       const bodyTemplate = extractBodyText(components);
       const variables = extractTemplateVariables(bodyTemplate);
+      const now = new Date().toISOString();
 
       const { error: upsertError } = await supabase.from("templates").upsert(
         {
@@ -170,9 +226,14 @@ export async function syncTemplatesFromYCloud(
           body_template: bodyTemplate,
           components: t.components ?? {},
           variables,
-          provider_template_id: typeof t.id === "string" ? t.id : null,
-          rejection_reason: null,
-          updated_at: new Date().toISOString(),
+          provider_template_id: templateOfficialId(t),
+          ...templateStatusPatch(
+            status,
+            extractRejectionReason(t.rejected_reason ?? t.reason),
+            previous.get(`${name}|${language}`),
+            now,
+          ),
+          updated_at: now,
         },
         {
           onConflict: "workspace_id,name,language",
@@ -194,7 +255,7 @@ export async function syncTemplatesFromYCloud(
     }
   }
 
-  return { synced, errors };
+  return { synced, errors, truncated };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

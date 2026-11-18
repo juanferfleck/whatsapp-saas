@@ -1,8 +1,11 @@
-// G1: Templates sync — pulls templates from YCloud and upserts into workspace.
+// G1: Templates sync — pulls templates from the workspace's WhatsApp provider
+// (YCloud or Kapso) and upserts them into the workspace.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { syncTemplatesFromYCloud } from "@/features/inbox/services/templates";
+import { syncTemplates } from "@/features/inbox/services/templates";
+import { WHATSAPP_NOT_CONNECTED } from "@/features/inbox/services/whatsapp-provider";
+import { WabaNotFoundError } from "@/features/inbox/services/ycloud-client";
 
 // ── Shared auth helper ────────────────────────────────────────────────────────
 
@@ -51,26 +54,42 @@ export async function POST(
   }
 
   try {
-    const result = await syncTemplatesFromYCloud(workspaceId);
-    return NextResponse.json({ synced: result.synced, errors: result.errors });
+    const result = await syncTemplates(workspaceId);
+    return NextResponse.json({
+      synced: result.synced,
+      errors: result.errors,
+      truncated: result.truncated,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[POST /api/workspace/[id]/templates/sync]:", err);
 
     // Surface integration-not-configured as a 422 so the UI can show a
     // helpful message instead of a generic 500.
-    if (message.includes("YCloud integration not found")) {
+    if (message.includes(WHATSAPP_NOT_CONNECTED)) {
       return NextResponse.json(
         {
           error:
-            "Integración de YCloud no configurada. Actívala en la pestaña Integraciones.",
+            "WhatsApp no está conectado. Elige YCloud o Kapso en la pestaña Integraciones.",
+        },
+        { status: 422 },
+      );
+    }
+    if (err instanceof WabaNotFoundError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
+    }
+    if (message.includes("falta waba_id")) {
+      return NextResponse.json(
+        {
+          error:
+            "Falta el WABA ID en la configuración de Kapso — sin él no se pueden sincronizar plantillas.",
         },
         { status: 422 },
       );
     }
 
     return NextResponse.json(
-      { error: "Error al sincronizar templates desde YCloud" },
+      { error: "Error al sincronizar templates" },
       { status: 500 },
     );
   }
